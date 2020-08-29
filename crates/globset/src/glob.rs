@@ -663,7 +663,7 @@ impl Tokens {
         for tok in tokens {
             match *tok {
                 Token::Literal(c) => {
-                    re.push_str(&char_to_escaped_literal(c));
+                    char_to_escaped_literal(re, c);
                 }
                 Token::Any => {
                     if options.literal_separator {
@@ -696,11 +696,11 @@ impl Tokens {
                     for r in ranges {
                         if r.0 == r.1 {
                             // Not strictly necessary, but nicer to look at.
-                            re.push_str(&char_to_escaped_literal(r.0));
+                            char_to_escaped_literal(re, r.0);
                         } else {
-                            re.push_str(&char_to_escaped_literal(r.0));
+                            char_to_escaped_literal(re, r.0);
                             re.push('-');
-                            re.push_str(&char_to_escaped_literal(r.1));
+                            char_to_escaped_literal(re, r.1);
                         }
                     }
                     re.push(']');
@@ -730,14 +730,15 @@ impl Tokens {
 
 /// Convert a Unicode scalar value to an escaped string suitable for use as
 /// a literal in a non-Unicode regex.
-fn char_to_escaped_literal(c: char) -> String {
-    bytes_to_escaped_literal(&c.to_string().into_bytes())
+fn char_to_escaped_literal(s: &mut String, c: char) {
+    let mut buf = [0; 4];
+    bytes_to_escaped_literal(s, c.encode_utf8(&mut buf).as_bytes())
 }
 
 /// Converts an arbitrary sequence of bytes to a UTF-8 string. All non-ASCII
 /// code units are converted to their escaped form.
-fn bytes_to_escaped_literal(bs: &[u8]) -> String {
-    let mut s = String::with_capacity(bs.len());
+fn bytes_to_escaped_literal(s: &mut String, bs: &[u8]) {
+    s.reserve(bs.len());
     for &b in bs {
         if b <= 0x7F {
             s.push_str(&regex::escape(&(b as char).to_string()));
@@ -745,7 +746,6 @@ fn bytes_to_escaped_literal(bs: &[u8]) -> String {
             s.push_str(&format!("\\x{:02x}", b));
         }
     }
-    s
 }
 
 struct Parser<'a> {
