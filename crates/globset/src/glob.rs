@@ -120,7 +120,33 @@ pub struct GlobMatcher {
     re: Regex,
 }
 
+/// A parent matcher for a single pattern.
+#[derive(Clone, Debug)]
+pub struct GlobParentMatcher {
+    /// The underlying pattern.
+    pat: Glob,
+    /// The parent pattern, as a compiled regex.
+    re: Regex,
+}
+
 impl GlobMatcher {
+    /// Tests whether the given path matches this pattern or not.
+    pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.is_match_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// Tests whether the given path matches this pattern or not.
+    pub fn is_match_candidate(&self, path: &Candidate) -> bool {
+        self.re.is_match(&path.path)
+    }
+
+    /// Returns the `Glob` used to compile this matcher.
+    pub fn glob(&self) -> &Glob {
+        &self.pat
+    }
+}
+
+impl GlobParentMatcher {
     /// Tests whether the given path matches this pattern or not.
     pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
         self.is_match_candidate(&Candidate::new(path.as_ref()))
@@ -261,6 +287,13 @@ impl Glob {
         let re =
             new_regex(&self.re).expect("regex compilation shouldn't fail");
         GlobMatcher { pat: self.clone(), re: re }
+    }
+
+    /// Returns a matcher for this pattern which matches the glob, plus any parent paths.
+    pub fn compile_parent_matcher(&self) -> GlobParentMatcher {
+        let re = self.tokens.to_parent_regex_with(&self.opts);
+        let re = new_regex(&re).expect("regex compilation shouldn't fail");
+        GlobParentMatcher { pat: self.clone(), re }
     }
 
     /// Returns a strategic matcher.
@@ -654,6 +687,18 @@ impl Tokens {
         re
     }
 
+    fn to_parent_regex_with(&self, options: &GlobOptions) -> String {
+        let mut re = String::new();
+        re.push_str("(?-u)");
+        if options.case_insensitive {
+            re.push_str("(?i)");
+        }
+        re.push_str("^(?:");
+        self.tokens_to_parent_regex(options, &self, &mut re);
+        re.push_str(")?$");
+        re
+    }
+
     fn tokens_to_regex(
         &self,
         options: &GlobOptions,
@@ -724,6 +769,105 @@ impl Tokens {
                     }
                 }
             }
+        }
+    }
+
+    fn tokens_to_parent_regex(
+        &self,
+        options: &GlobOptions,
+        tokens: &[Token],
+        re: &mut String,
+    ) {
+        let mut optional_components = 0;
+
+        for tok in tokens {
+            match *tok {
+                Token::Literal(c) => {
+                    if c == '/' {
+                        re.push_str("(?:/");
+                        optional_components += 1;
+                        re.push_str("(?:");
+                        optional_components += 1;
+                    } else {
+                        re.push_str(&char_to_escaped_literal(c));
+                    }
+                }
+                Token::Any => {
+                    if options.literal_separator {
+                        re.push_str("[^/]");
+                    } else {
+                        re.push_str("(?:.");
+                        optional_components += 1;
+                        re.push_str("(?:");
+                        optional_components += 1;
+                    }
+                }
+                Token::ZeroOrMore => {
+                    if options.literal_separator {
+                        re.push_str("[^/]*");
+                    } else {
+                        re.push_str(".*");
+                        re.push_str("(?:");
+                        optional_components += 1;
+                    }
+                }
+                Token::RecursivePrefix => {
+                    re.push_str(".*");
+                    break;
+                }
+                Token::RecursiveSuffix | Token::RecursiveZeroOrMore => {
+                    re.push_str("(?:/.*");
+                    optional_components += 1;
+                    break;
+                }
+                Token::Class { negated, ref ranges } => {
+                    for r in ranges {
+                        if ((r.0)..=(r.1)).contains(&'/') != negated {
+                            re.push_str("(?:");
+                            optional_components += 1;
+                            break;
+                        }
+                    }
+
+                    re.push_str("[");
+                    if negated {
+                        re.push('^');
+                    }
+                    for r in ranges {
+                        if r.0 == r.1 {
+                            // Not strictly necessary, but nicer to look at.
+                            re.push_str(&char_to_escaped_literal(r.0));
+                        } else {
+                            re.push_str(&char_to_escaped_literal(r.0));
+                            re.push('-');
+                            re.push_str(&char_to_escaped_literal(r.1));
+                        }
+                    }
+                    re.push(']');
+                }
+                Token::Alternates(ref patterns) => {
+                    let mut parts = vec![];
+                    for pat in patterns {
+                        let mut altre = String::new();
+                        self.tokens_to_parent_regex(options, &pat, &mut altre);
+                        if !altre.is_empty() {
+                            parts.push(altre);
+                        }
+                    }
+
+                    // It is possible to have an empty set in which case the
+                    // resulting alternation '()' would be an error.
+                    if !parts.is_empty() {
+                        re.push('(');
+                        re.push_str(&parts.join("|"));
+                        re.push(')');
+                    }
+                }
+            }
+        }
+
+        for _ in 0..optional_components {
+            re.push_str(")?");
         }
     }
 }
@@ -1007,6 +1151,8 @@ fn ends_with(needle: &[u8], haystack: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::Token::*;
     use super::{Glob, GlobBuilder, Token};
     use {ErrorKind, GlobSetBuilder};
@@ -1061,6 +1207,32 @@ mod tests {
         };
     }
 
+    macro_rules! toparentregex {
+        ($name:ident, $pat:expr, $re:expr) => {
+            toparentregex!($name, $pat, $re, Options::default());
+        };
+        ($name:ident, $pat:expr, $re:expr, $options:expr) => {
+            #[test]
+            fn $name() {
+                let mut builder = GlobBuilder::new($pat);
+                if let Some(casei) = $options.casei {
+                    builder.case_insensitive(casei);
+                }
+                if let Some(litsep) = $options.litsep {
+                    builder.literal_separator(litsep);
+                }
+                if let Some(bsesc) = $options.bsesc {
+                    builder.backslash_escape(bsesc);
+                }
+                let pat = builder.build().unwrap();
+                assert_eq!(
+                    format!("(?-u){}", $re),
+                    pat.compile_parent_matcher().re.as_str()
+                );
+            }
+        };
+    }
+
     macro_rules! matches {
         ($name:ident, $pat:expr, $path:expr) => {
             matches!($name, $pat, $path, Options::default());
@@ -1078,13 +1250,51 @@ mod tests {
                 if let Some(bsesc) = $options.bsesc {
                     builder.backslash_escape(bsesc);
                 }
+
+                let path: &Path = $path.as_ref();
+
                 let pat = builder.build().unwrap();
                 let matcher = pat.compile_matcher();
+                let parent_matcher = pat.compile_parent_matcher();
                 let strategic = pat.compile_strategic_matcher();
                 let set = GlobSetBuilder::new().add(pat).build().unwrap();
-                assert!(matcher.is_match($path));
-                assert!(strategic.is_match($path));
-                assert!(set.is_match($path));
+                assert!(matcher.is_match(path));
+                assert!(strategic.is_match(path));
+                assert!(set.is_match(path));
+
+                for parent in path.ancestors() {
+                    assert!(parent_matcher.is_match(parent));
+                }
+            }
+        };
+    }
+
+    macro_rules! parent_matches {
+        ($name:ident, $pat:expr, $path:expr) => {
+            parent_matches!($name, $pat, $path, Options::default());
+        };
+        ($name:ident, $pat:expr, $path:expr, $options:expr) => {
+            #[test]
+            fn $name() {
+                let mut builder = GlobBuilder::new($pat);
+                if let Some(casei) = $options.casei {
+                    builder.case_insensitive(casei);
+                }
+                if let Some(litsep) = $options.litsep {
+                    builder.literal_separator(litsep);
+                }
+                if let Some(bsesc) = $options.bsesc {
+                    builder.backslash_escape(bsesc);
+                }
+
+                let path: &Path = $path.as_ref();
+
+                let pat = builder.build().unwrap();
+                let parent_matcher = pat.compile_parent_matcher();
+
+                for parent in path.ancestors() {
+                    assert!(parent_matcher.is_match(parent));
+                }
             }
         };
     }
@@ -1111,6 +1321,36 @@ mod tests {
                 let strategic = pat.compile_strategic_matcher();
                 let set = GlobSetBuilder::new().add(pat).build().unwrap();
                 assert!(!matcher.is_match($path));
+                assert!(!strategic.is_match($path));
+                assert!(!set.is_match($path));
+            }
+        };
+    }
+
+    macro_rules! parent_nmatches {
+        ($name:ident, $pat:expr, $path:expr) => {
+            parent_nmatches!($name, $pat, $path, Options::default());
+        };
+        ($name:ident, $pat:expr, $path:expr, $options:expr) => {
+            #[test]
+            fn $name() {
+                let mut builder = GlobBuilder::new($pat);
+                if let Some(casei) = $options.casei {
+                    builder.case_insensitive(casei);
+                }
+                if let Some(litsep) = $options.litsep {
+                    builder.literal_separator(litsep);
+                }
+                if let Some(bsesc) = $options.bsesc {
+                    builder.backslash_escape(bsesc);
+                }
+                let pat = builder.build().unwrap();
+                let matcher = pat.compile_matcher();
+                let parent_matcher = pat.compile_parent_matcher();
+                let strategic = pat.compile_strategic_matcher();
+                let set = GlobSetBuilder::new().add(pat).build().unwrap();
+                assert!(!matcher.is_match($path));
+                assert!(!parent_matcher.is_match($path));
                 assert!(!strategic.is_match($path));
                 assert!(!set.is_match($path));
             }
@@ -1238,6 +1478,50 @@ mod tests {
     toregex!(re32, "/a**", r"^/a.*.*$");
     toregex!(re33, "/**a", r"^/.*.*a$");
     toregex!(re34, "/a**b", r"^/a.*.*b$");
+
+    toparentregex!(parent_casei, "a", "(?i)^(?:a)?$", &CASEI);
+
+    toparentregex!(parent_slash1, "?", r"^(?:[^/])?$", SLASHLIT);
+    toparentregex!(parent_slash2, "*", r"^(?:[^/]*)?$", SLASHLIT);
+
+    toparentregex!(parent_re1, "a", "^(?:a)?$");
+    toparentregex!(parent_re2, "?", "^(?:(?:.(?:)?)?)?$");
+    toparentregex!(parent_re3, "*", "^(?:.*(?:)?)?$");
+    toparentregex!(parent_re4, "a?", "^(?:a(?:.(?:)?)?)?$");
+    toparentregex!(parent_re5, "?a", "^(?:(?:.(?:a)?)?)?$");
+    toparentregex!(parent_re6, "a*", "^(?:a.*(?:)?)?$");
+    toparentregex!(parent_re7, "*a", "^(?:.*(?:a)?)?$");
+    toparentregex!(parent_re8, "[*]", r"^(?:[\*])?$");
+    toparentregex!(parent_re9, "[+]", r"^(?:[\+])?$");
+    toparentregex!(parent_re10, "+", r"^(?:\+)?$");
+    toparentregex!(parent_re11, "☃", r"^(?:\xe2\x98\x83)?$");
+    toparentregex!(parent_re12, "**", r"^(?:.*)?$");
+    toparentregex!(parent_re13, "**/", r"^(?:.*)?$");
+    toparentregex!(parent_re14, "**/*", r"^(?:.*)?$");
+    toparentregex!(parent_re15, "**/**", r"^(?:.*)?$");
+    toparentregex!(parent_re16, "**/**/*", r"^(?:.*)?$");
+    toparentregex!(parent_re17, "**/**/**", r"^(?:.*)?$");
+    toparentregex!(parent_re18, "**/**/**/*", r"^(?:.*)?$");
+    toparentregex!(parent_re19, "a/**", r"^(?:a(?:/.*)?)?$");
+    toparentregex!(parent_re20, "a/**/**", r"^(?:a(?:/.*)?)?$");
+    toparentregex!(parent_re21, "a/**/**/**", r"^(?:a(?:/.*)?)?$");
+    toparentregex!(parent_re22, "a/**/b", r"^(?:a(?:/.*)?)?$");
+    toparentregex!(parent_re23, "a/**/**/b", r"^(?:a(?:/.*)?)?$");
+    toparentregex!(parent_re24, "a/**/**/**/b", r"^(?:a(?:/.*)?)?$");
+    toparentregex!(parent_re25, "**/b", r"^(?:.*)?$");
+    toparentregex!(parent_re26, "**/**/b", r"^(?:.*)?$");
+    toparentregex!(parent_re27, "**/**/**/b", r"^(?:.*)?$");
+    toparentregex!(parent_re28, "a**", r"^(?:a.*(?:.*(?:)?)?)?$");
+    toparentregex!(parent_re29, "**a", r"^(?:.*(?:.*(?:a)?)?)?$");
+    toparentregex!(parent_re30, "a**b", r"^(?:a.*(?:.*(?:b)?)?)?$");
+    toparentregex!(parent_re31, "***", r"^(?:.*(?:.*(?:.*(?:)?)?)?)?$");
+    toparentregex!(parent_re32, "/a**", r"^(?:(?:/(?:a.*(?:.*(?:)?)?)?)?)?$");
+    toparentregex!(parent_re33, "/**a", r"^(?:(?:/(?:.*(?:.*(?:a)?)?)?)?)?$");
+    toparentregex!(
+        parent_re34,
+        "/a**b",
+        r"^(?:(?:/(?:a.*(?:.*(?:b)?)?)?)?)?$"
+    );
 
     matches!(match1, "a", "a");
     matches!(match2, "a*b", "a_b");
@@ -1400,6 +1684,33 @@ mod tests {
         "some/one/two/three/needle.txt",
         SLASHLIT
     );
+
+    parent_nmatches!(parent_matchslash1, "abc?efg", "abc/efg", SLASHLIT);
+    parent_nmatches!(parent_matchslash2, "abc*efg", "abc/efg", SLASHLIT);
+
+    parent_matches!(parent_match1, "abc/efg", "abc");
+    parent_matches!(parent_match2, "/a", "/");
+    parent_matches!(parent_match3, "abc?efg", "abc");
+    parent_matches!(parent_match4, "abc?efg", "abcdefg");
+    parent_matches!(parent_match5, "abc*efg", "abc");
+    parent_matches!(parent_match6, "abc*efg/hij", "abcddefg");
+    parent_matches!(parent_match7, "**/hij", "abc");
+    parent_matches!(parent_match8, "foo/**", "foo");
+    parent_matches!(parent_match9, "foo[/]bar", "foo");
+    parent_matches!(parent_match10, "foo[!d]bar", "foo");
+    parent_matches!(parent_match11, "{foo,bar}/baz", "foo");
+    parent_matches!(parent_match12, "{foo/bar,bar}", "foo");
+
+    parent_nmatches!(parent_matchnot1, "base/**/*.txt", "foo");
+    parent_nmatches!(parent_matchnot2, "base/**/*.txt", "foo/x.txt");
+    parent_nmatches!(parent_matchnot3, "base/**/*.txt", "foo/bar/x.txt");
+    parent_nmatches!(parent_matchnot4, "b*/**/*.txt", "foo");
+    parent_nmatches!(parent_matchnot5, "b*/**/*.txt", "foo/bar");
+    parent_nmatches!(parent_matchnot6, "*/bar/*.txt", "foo/baz", SLASHLIT);
+    parent_nmatches!(parent_matchnot7, "abc*efg/hij", "abcde", SLASHLIT);
+    parent_nmatches!(parent_matchnot8, "foo[b]bar", "foo");
+    parent_nmatches!(parent_matchnot9, "foo[!/]bar", "foo");
+    parent_nmatches!(parent_matchnot10, "{foo/bar,bar}", "baz");
 
     macro_rules! extract {
         ($which:ident, $name:ident, $pat:expr, $expect:expr) => {
